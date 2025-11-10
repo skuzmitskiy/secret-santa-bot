@@ -510,7 +510,10 @@ async def share_cmd(update: Update, context: CallbackContext) -> None:
         [[InlineKeyboardButton(text="Join the event", url=link)]]
     )
     await update.message.reply_text(
-        f"Share this link:\n{link}", reply_markup=kb
+        "Share this link:\n"
+    )
+    await update.message.reply_text(
+        f"{link}", reply_markup=kb
     )
 
 

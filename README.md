@@ -56,9 +56,9 @@ python run.py
 /close <event_id>                       – Close signups (creator only)
 /reopen <event_id>                      – Reopen signups (creator only)
 /add_illegal <id> <giver> <receiver>    – Forbid G→R (creator only)
-/view_illegal <event_id>                – Show forbidden pairs
+/view_illegal <event_id>                – Show forbidden pairs (creator only)
 /clear_illegal <event_id>               – Remove all forbidden pairs (creator only)
-/draw <event_id>                        – Run the single-cycle draw & DM participants
+/draw <event_id>                        – Run draw & DM participants (creator only)
 /debug_cycle <event_id>                 – Show the cycle (creator only)
 /deleteevent <event_id>                 – Delete the event (creator only)
 ```
@@ -71,7 +71,6 @@ python run.py
 4. `/close 1` when you’re ready
 5. (Optional) Add constraints with `/add_illegal 1 Alice Bob`
 6. `/draw 1` to compute the single cycle and DM everyone
-7. `/debug_cycle 1` (creator only) if you need to inspect the cycle
 
 > Note: Telegram can block DMs to users who never pressed **Start** on the bot. Ask participants to start the bot before the draw.
 
