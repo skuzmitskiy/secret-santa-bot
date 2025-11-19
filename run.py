@@ -42,6 +42,7 @@ from telegram import (
     Update,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    ForceReply,
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -193,11 +194,11 @@ def list_my_events(user_id: int) -> List[Event]:
 def add_participant(event_id: int, user_id: int, display_name: str) -> bool:
     with db() as conn:
         try:
-            conn.execute(
+            cur = conn.execute(
                 "INSERT OR IGNORE INTO event_participants (event_id, user_id, display_name) VALUES (?, ?, ?)",
                 (event_id, user_id, display_name),
             )
-            return True
+            return cur.rowcount > 0
         except sqlite3.IntegrityError:
             return False
 
@@ -217,6 +218,14 @@ def list_participants(event_id: int) -> List[Participant]:
             (event_id,),
         )
         return [Participant(user_id=r["user_id"], display_name=r["display_name"]) for r in cur.fetchall()]
+
+
+def update_participant_name(event_id: int, user_id: int, display_name: str) -> None:
+    with db() as conn:
+        conn.execute(
+            "UPDATE event_participants SET display_name = ? WHERE event_id = ? AND user_id = ?",
+            (display_name, event_id, user_id),
+        )
 
 
 def set_join_open(event_id: int, open_flag: bool) -> None:
@@ -445,26 +454,70 @@ async def start_cmd(update: Update, context: CallbackContext) -> None:
             await update.message.reply_text("Signups for this event are closed.")
             return
         display_name = (user.full_name or user.username or str(user.id)).strip()
-        add_participant(event_id, user.id, display_name)
+        is_new_participant = add_participant(event_id, user.id, display_name)
         await update.message.reply_text(
             f"Здравствуйте!\n"
             f"\n"
             f"Вы успешно присоединились к игре «<b>{ev.title}</b>».\n"
             f"Регистрация участников открыта до 19 декабря 2025 года.\n"
             f"\n"
-            f"Важный шаг: Чтобы ваш Тайный Санта знал, кому готовить подарок, пожалуйста, подтвердите свое участие, указав свои ФИО (полностью).\n"
+            f"Важный шаг: Чтобы ваш Тайный Санта знал, кому готовить подарок, пожалуйста, подтвердите своё участие, указав свои Имя и Фамилию (полностью).\n"
             f"\n"
             f"Жеребьевка состоится после окончания регистрации, а вручение подарков запланировано на 30 декабря 2025 года.\n"
             f"\n"
             f"Спасибо, что участвуете!",
             parse_mode=ParseMode.HTML,
         )
+        if is_new_participant and update.message:
+            pending = list(context.user_data.get("pending_name_events", []))
+            if event_id not in pending:
+                pending.append(event_id)
+            context.user_data["pending_name_events"] = pending
+            await update.message.reply_text(
+                "Пожалуйста, ответьте на это сообщение и напишите свои Имя и Фамилию через пробел. Например: Иван Иванов.",
+                reply_markup=ForceReply(input_field_placeholder="Имя Фамилия"),
+            )
         return
 
     # Default /start
     await update.message.reply_text(
         "Hi! I'm a Secret Santa bot. Use /help for commands."
     )
+
+
+async def collect_name_response(update: Update, context: CallbackContext) -> None:
+    message = update.message
+    if not message or not message.text:
+        return
+    pending_events = context.user_data.get("pending_name_events")
+    if not pending_events:
+        return
+    if update.effective_chat and update.effective_chat.type != "private":
+        return
+
+    text = message.text.strip()
+    parts = [token for token in text.split() if token]
+    if len(parts) < 2:
+        await message.reply_text("Нужно указать как минимум Имя и Фамилию через пробел. Например: Иван Иванов.")
+        return
+
+    first_name = parts[0]
+    last_name = " ".join(parts[1:]).strip()
+    display_name = f"{first_name} {last_name}".strip()
+
+    updated_events: List[str] = []
+    for event_id in dict.fromkeys(pending_events):
+        update_participant_name(event_id, update.effective_user.id, display_name)
+        ev = get_event(event_id)
+        if ev:
+            updated_events.append(ev.title)
+
+    context.user_data["pending_name_events"] = []
+
+    confirmation = f"Спасибо! Зафиксировал ваше имя: {display_name}."
+    if updated_events:
+        confirmation += "\nСобытия: " + ", ".join(updated_events)
+    await message.reply_text(confirmation)
 
 
 async def help_cmd(update: Update, context: CallbackContext) -> None:
@@ -826,70 +879,11 @@ async def draw_cmd(update: Update, context: CallbackContext) -> None:
 
     participants_map = {p.user_id: p.display_name for p in list_participants(eid)}
 
-    # helper: отправить запрос и ждать ответ от пользователя
-    async def ask_name(app: Application, user_id: int, timeout: int = 120):
-        try:
-            await app.bot.send_message(
-                chat_id=user_id,
-                text="Пожалуйста, пришлите своё Имя и Фамилию в формате: Имя Фамилия.",
-            )
-        except Exception as e:
-            logger.warning("Cannot send name request to %s: %s", user_id, e)
-            return None
-
-    # ждем входящее сообщение от этого пользователя
-    # предполагаем, что у нас есть доступ к update_queue приложения
-    try:
-        # application.update_queue доступна в python-telegram-bot v20+
-        while True:
-            update = await asyncio.wait_for(app.update_queue.get(), timeout=timeout)
-            if not update.message:
-                continue
-            if update.message.from_user and update.message.from_user.id == user_id:
-                text = (update.message.text or "").strip()
-                if not text:
-                    await app.bot.send_message(chat_id=user_id, text="Не понял. Пожалуйста, отправьте Имя и Фамилию текстом.")
-                    continue
-                parts = text.split()
-                first = parts[0]
-                last = " ".join(parts[1:]) if len(parts) > 1 else ""
-                return {"first_name": first, "last_name": last}
-    except asyncio.TimeoutError:
-        await app.bot.send_message(chat_id=user_id, text="Время ожидания имени истекло — использую доступные данные.")
-        return None
-    except Exception as e:
-        logger.warning("Error while waiting name from %s: %s", user_id, e)
-        return None
-
-    # основной фрагмент — DM each participant
     app: Application = context.application
     sent = 0
     for giver, receiver in pairs:
-        giver_data = participants_map.get(giver)
-        # поддерживаем разные форматы: строка или dict
-        if isinstance(giver_data, dict):
-            giver_name = f"{giver_data.get('first_name','')}".strip()
-            if giver_data.get('last_name'):
-                giver_name = (giver_name + " " + giver_data.get('last_name')).strip()
-        else:
-            giver_name = str(giver_data or giver)
-    
-        # если имени нет (пустая строка или только id), запросим
-        if not giver_name or giver_name.isdigit():
-            result = await ask_name(app, giver)
-            if result:
-                participants_map[giver] = result
-                giver_name = {result.get('first_name','')}
-                if result.get('last_name'):
-                    giver_name += {result.get('last_name')}
-    
-        receiver_data = participants_map.get(receiver)
-        if isinstance(receiver_data, dict):
-            receiver_name = receiver_data.get('first_name','')
-            if receiver_data.get('last_name'):
-                receiver_name = (receiver_name + receiver_data.get('last_name')).strip()
-        else:
-            receiver_name = str(receiver_data or receiver)
+        giver_name = str(participants_map.get(giver) or giver)
+        receiver_name = str(participants_map.get(receiver) or receiver)
     
         try:
             await app.bot.send_message(
@@ -943,6 +937,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("draw", draw_cmd))
     app.add_handler(CommandHandler("debug_cycle", debug_cycle_cmd))
     app.add_handler(CommandHandler("deleteevent", deleteevent_cmd))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, collect_name_response))
 
     return app
 
