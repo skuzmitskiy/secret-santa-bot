@@ -386,42 +386,42 @@ def compute_single_cycle_with_constraints(event_id: int) -> List[Tuple[int, int]
 # Bot command handlers
 # ------------------------------------------------------------
 HELP_TEXT = (
-    """<b>Secret Santa Bot</b> 🎁
+    """<b>Тайный Санта</b> 🎁
 
-Create events, let participants join via link, close signups and run a draw that produces <i>a single cycle</i> (no subloops).
+Создавайте события, позволяйте участникам присоединяться по ссылке, закрывайте регистрацию и проводите розыгрыш, который генерирует единый цикл (без подциклов).
 
-<b>Main commands</b>
+<b>Основные команды Secret Santa Bot</b>
 
-• /newevent <i>title</i> – create a new event
+• /newevent <i>title</i> – создать новое событие
 
-• /myevents – list your events
+• /myevents – список ваших событий
 
-• /share <i>event_id</i> – link to join
+• /share <i>event_id</i> – ссылка для присоединения
 
-• /list <i>event_id</i> – participants
+• /list <i>event_id</i> – участники
 
-• /leave <i>event_id</i> – leave an event
+• /leave <i>event_id</i> – покинуть событие
 
-• /close <i>event_id</i> – close signups (creator only)
+• /close <i>event_id</i> – закрыть регистрацию (только создатель)
 
-• /reopen <i>event_id</i> – reopen signups (creator only)
+• /reopen <i>event_id</i> – открыть регистрацию снова (только создатель)
 
-• /add_illegal <i>event_id</i> <i>giver</i> <i>receiver</i> – forbid directional pair G→R (creator only)
+• /add_illegal <i>event_id</i> <i>giver</i> <i>receiver</i> – запретить направленную пару Д→О (только создатель)
 
-   (user can be @username or the name as shown in the list)
+   (пользователь может быть указан как @username или по имени, как в списке)
 
-• /view_illegal <i>event_id</i> – show forbidden pairs
+• /view_illegal <i>event_id</i> – показать запрещённые пары
 
-• /clear_illegal <i>event_id</i> – remove forbidden pairs (creator only)
+• /clear_illegal <i>event_id</i> – удалить запрещённые пары (только создатель)
 
-• /draw <i>event_id</i> – perform the draw and send DMs
+• /draw <i>event_id</i> – провести жеребьёвку и отправить личные сообщения
 
-• /debug_cycle <i>event_id</i> – show the chain (creator only)
+• /debug_cycle <i>event_id</i> – показать цепочку (только создатель)
 
-• /deleteevent <i>event_id</i> – delete the event (creator only)
+• /deleteevent <i>event_id</i> – удалить событие (только создатель)
 
-<b>Join via link</b>
-Use /share to get a link like <code>https://t.me/%s?start=join_EVENTID</code>. Clicking it will register the user if signups are open.
+<b>Присоединение по ссылке</b>
+Используйте /share, чтобы получить ссылку вида https://t.me/%s?start=join_EVENTID. По клику пользователь зарегистрируется, если регистрация открыта.
 """
 ) % BOT_USERNAME
 
@@ -447,7 +447,16 @@ async def start_cmd(update: Update, context: CallbackContext) -> None:
         display_name = (user.full_name or user.username or str(user.id)).strip()
         add_participant(event_id, user.id, display_name)
         await update.message.reply_text(
-            f"You have been registered for <b>{ev.title}</b> (ID {ev.id}).",
+            f"Здравствуйте!\n"
+            f"\n"
+            f"Вы успешно присоединились к игре «<b>{ev.title}</b>».\n"
+            f"Регистрация участников открыта до 19 декабря 2025 года.\n"
+            f"\n"
+            f"Важный шаг: Чтобы ваш Тайный Санта знал, кому готовить подарок, пожалуйста, подтвердите свое участие, указав свои ФИО (полностью).\n"
+            f"\n"
+            f"Жеребьевка состоится после окончания регистрации, а вручение подарков запланировано на 30 декабря 2025 года.\n"
+            f"\n"
+            f"Спасибо, что участвуете!",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -817,18 +826,83 @@ async def draw_cmd(update: Update, context: CallbackContext) -> None:
 
     participants_map = {p.user_id: p.display_name for p in list_participants(eid)}
 
-    # DM each participant
+    # helper: отправить запрос и ждать ответ от пользователя
+    async def ask_name(app: Application, user_id: int, timeout: int = 120):
+        try:
+            await app.bot.send_message(
+                chat_id=user_id,
+                text="Пожалуйста, пришлите своё Имя и Фамилию в формате: Имя Фамилия.",
+            )
+        except Exception as e:
+            logger.warning("Cannot send name request to %s: %s", user_id, e)
+            return None
+
+    # ждем входящее сообщение от этого пользователя
+    # предполагаем, что у нас есть доступ к update_queue приложения
+    try:
+        # application.update_queue доступна в python-telegram-bot v20+
+        while True:
+            update = await asyncio.wait_for(app.update_queue.get(), timeout=timeout)
+            if not update.message:
+                continue
+            if update.message.from_user and update.message.from_user.id == user_id:
+                text = (update.message.text or "").strip()
+                if not text:
+                    await app.bot.send_message(chat_id=user_id, text="Не понял. Пожалуйста, отправьте Имя и Фамилию текстом.")
+                    continue
+                parts = text.split()
+                first = parts[0]
+                last = " ".join(parts[1:]) if len(parts) > 1 else ""
+                return {"first_name": first, "last_name": last}
+    except asyncio.TimeoutError:
+        await app.bot.send_message(chat_id=user_id, text="Время ожидания имени истекло — использую доступные данные.")
+        return None
+    except Exception as e:
+        logger.warning("Error while waiting name from %s: %s", user_id, e)
+        return None
+
+    # основной фрагмент — DM each participant
     app: Application = context.application
     sent = 0
     for giver, receiver in pairs:
-        giver_name = participants_map.get(giver, str(giver))
-        receiver_name = participants_map.get(receiver, str(receiver))
+        giver_data = participants_map.get(giver)
+        # поддерживаем разные форматы: строка или dict
+        if isinstance(giver_data, dict):
+            giver_name = f"{giver_data.get('first_name','')}".strip()
+            if giver_data.get('last_name'):
+                giver_name = (giver_name + " " + giver_data.get('last_name')).strip()
+        else:
+            giver_name = str(giver_data or giver)
+    
+        # если имени нет (пустая строка или только id), запросим
+        if not giver_name or giver_name.isdigit():
+            result = await ask_name(app, giver)
+            if result:
+                participants_map[giver] = result
+                giver_name = {result.get('first_name','')}
+                if result.get('last_name'):
+                    giver_name += {result.get('last_name')}
+    
+        receiver_data = participants_map.get(receiver)
+        if isinstance(receiver_data, dict):
+            receiver_name = receiver_data.get('first_name','')
+            if receiver_data.get('last_name'):
+                receiver_name = (receiver_name + receiver_data.get('last_name')).strip()
+        else:
+            receiver_name = str(receiver_data or receiver)
+    
         try:
             await app.bot.send_message(
                 chat_id=giver,
                 text=(
-                    f"Hi {giver_name}! 🎁\n"
-                    f"You are the Secret Santa for the event <b>{ev.title}</b>. Your recipient is: <b>{receiver_name}</b>."
+                    f"Здравствуй, {giver_name}! 🎁\n"
+                    f"\n"
+                    f"Жеребьёвка игры <b>{ev.title}</b> завершена.\n"
+                    f"Твой подопечный, для которого ты готовишь подарок - <b>{receiver_name}</b>.\n"
+                    f"\n"
+                    f"Твой бюджет на создание новогоднего чуда — от 500 рублей!\n"
+                    f"\n"
+                    f"Покажи, на что способен! 😉"
                 ),
                 parse_mode=ParseMode.HTML,
             )
