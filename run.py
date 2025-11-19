@@ -36,7 +36,13 @@ import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import IO, Dict, List, Optional, Sequence, Tuple
+
+try:
+    import fcntl  # type: ignore
+except ImportError:  # pragma: no cover
+    fcntl = None  # type: ignore
 
 from telegram import (
     Update,
@@ -67,6 +73,56 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 BOT_USERNAME = os.environ.get("BOT_USERNAME", "your_bot_username")  # without @
 DB_PATH = os.environ.get("SS_DB_PATH", "secretsanta.db")
+LOCK_FILE = Path(os.environ.get("SS_LOCK_FILE", str(Path(DB_PATH).with_suffix(".lock"))))
+_LOCK_HANDLE: Optional[IO[str]] = None
+
+
+def acquire_single_instance_lock() -> bool:
+    """Prevent running multiple polling loops on the same host."""
+    global _LOCK_HANDLE
+    if fcntl is None:
+        logger.warning("fcntl module not available; skipping single-instance lock enforcement.")
+        return False
+    try:
+        LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # Ignore inability to create parent; open() will raise a clearer error.
+        pass
+    handle = open(LOCK_FILE, "w+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        raise RuntimeError(
+            f"Another Secret Santa bot instance appears to be running (lock file: {LOCK_FILE}). "
+            "Stop the other process or remove the stale lock before starting a new instance."
+        )
+    handle.truncate(0)
+    handle.write(f"{os.getpid()}\n")
+    handle.flush()
+    _LOCK_HANDLE = handle
+    logger.info("Acquired single-instance lock at %s", LOCK_FILE)
+    return True
+
+
+def release_single_instance_lock() -> None:
+    global _LOCK_HANDLE
+    if _LOCK_HANDLE is None:
+        return
+    try:
+        if fcntl is not None:
+            fcntl.flock(_LOCK_HANDLE.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        Path(_LOCK_HANDLE.name).unlink(missing_ok=True)
+    except Exception:
+        pass
+    try:
+        _LOCK_HANDLE.close()
+    except Exception:
+        pass
+    _LOCK_HANDLE = None
 
 # ------------------------------------------------------------
 # Database helpers
@@ -106,6 +162,14 @@ CREATE TABLE IF NOT EXISTS assignments (
     receiver_id INTEGER NOT NULL,
     created_at TEXT NOT NULL,
     PRIMARY KEY (event_id, giver_id),
+    FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS pending_name_requests (
+    event_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    requested_at TEXT NOT NULL,
+    PRIMARY KEY (event_id, user_id),
     FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE
 );
 """
@@ -203,10 +267,56 @@ def add_participant(event_id: int, user_id: int, display_name: str) -> bool:
             return False
 
 
+def add_pending_name_request(event_id: int, user_id: int) -> None:
+    with db() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO pending_name_requests (event_id, user_id, requested_at) VALUES (?, ?, ?)",
+            (event_id, user_id, datetime.utcnow().isoformat()),
+        )
+
+
+def has_pending_name_request(event_id: int, user_id: int) -> bool:
+    with db() as conn:
+        cur = conn.execute(
+            "SELECT 1 FROM pending_name_requests WHERE event_id = ? AND user_id = ?",
+            (event_id, user_id),
+        )
+        return cur.fetchone() is not None
+
+
+def list_pending_name_events(user_id: int) -> List[Tuple[int, str]]:
+    with db() as conn:
+        cur = conn.execute(
+            """
+            SELECT p.event_id, e.title
+            FROM pending_name_requests AS p
+            JOIN events AS e ON e.id = p.event_id
+            WHERE p.user_id = ?
+            ORDER BY p.requested_at ASC
+            """,
+            (user_id,),
+        )
+        return [(row["event_id"], row["title"]) for row in cur.fetchall()]
+
+
+def clear_pending_name_requests(user_id: int, event_ids: Sequence[int]) -> None:
+    if not event_ids:
+        return
+    with db() as conn:
+        conn.executemany(
+            "DELETE FROM pending_name_requests WHERE user_id = ? AND event_id = ?",
+            [(user_id, eid) for eid in event_ids],
+        )
+
+
 def remove_participant(event_id: int, user_id: int) -> None:
     with db() as conn:
         conn.execute(
             "DELETE FROM event_participants WHERE event_id = ? AND user_id = ?",
+            (event_id, user_id),
+        )
+        conn.execute(
+            "DELETE FROM pending_name_requests WHERE event_id = ? AND user_id = ?",
             (event_id, user_id),
         )
 
@@ -218,6 +328,21 @@ def list_participants(event_id: int) -> List[Participant]:
             (event_id,),
         )
         return [Participant(user_id=r["user_id"], display_name=r["display_name"]) for r in cur.fetchall()]
+
+
+def list_user_memberships(user_id: int) -> List[Tuple[int, str]]:
+    with db() as conn:
+        cur = conn.execute(
+            """
+            SELECT ep.event_id, e.title
+            FROM event_participants AS ep
+            JOIN events AS e ON e.id = ep.event_id
+            WHERE ep.user_id = ?
+            ORDER BY ep.event_id DESC
+            """,
+            (user_id,),
+        )
+        return [(row["event_id"], row["title"]) for row in cur.fetchall()]
 
 
 def update_participant_name(event_id: int, user_id: int, display_name: str) -> None:
@@ -468,13 +593,24 @@ async def start_cmd(update: Update, context: CallbackContext) -> None:
             f"Спасибо, что участвуете!",
             parse_mode=ParseMode.HTML,
         )
-        if is_new_participant and update.message:
-            pending = list(context.user_data.get("pending_name_events", []))
+        needs_name = False
+        if is_new_participant:
+            add_pending_name_request(event_id, user.id)
+            needs_name = True
+        elif has_pending_name_request(event_id, user.id):
+            needs_name = True
+
+        if needs_name and update.message:
+            pending = list(dict.fromkeys(context.user_data.get("pending_name_events", [])))
             if event_id not in pending:
                 pending.append(event_id)
             context.user_data["pending_name_events"] = pending
             await update.message.reply_text(
-                "Пожалуйста, ответьте на это сообщение и напишите свои Имя и Фамилию через пробел. Например: Иван Иванов.",
+                "Пожалуйста, ответьте на это сообщение и напишите свои Имя и Фамилию через пробел "
+                "для участия в событии «{title}» (ID {eid}). Например: Иван Иванов.".format(
+                    title=ev.title, eid=ev.id
+                ),
+                parse_mode=ParseMode.HTML,
                 reply_markup=ForceReply(input_field_placeholder="Имя Фамилия"),
             )
         return
@@ -487,11 +623,30 @@ async def start_cmd(update: Update, context: CallbackContext) -> None:
 
 async def collect_name_response(update: Update, context: CallbackContext) -> None:
     message = update.message
-    if not message or not message.text:
+    user = update.effective_user
+    if not message or not message.text or not user:
         return
     pending_events = context.user_data.get("pending_name_events")
-    if not pending_events:
-        return
+    pending_pairs: List[Tuple[int, Optional[str]]] = []
+    if pending_events:
+        unique_ids = list(dict.fromkeys(pending_events))
+        for event_id in unique_ids:
+            ev = get_event(event_id)
+            if ev:
+                pending_pairs.append((event_id, ev.title))
+    else:
+        db_pending = list_pending_name_events(user.id)
+        if db_pending:
+            pending_pairs = [(eid, title) for eid, title in db_pending]
+            unique_ids = [eid for eid, _ in pending_pairs]
+            context.user_data["pending_name_events"] = unique_ids[:]
+
+    if not pending_pairs:
+        memberships = list_user_memberships(user.id)
+        if not memberships:
+            return
+        pending_pairs = memberships
+
     if update.effective_chat and update.effective_chat.type != "private":
         return
 
@@ -506,17 +661,29 @@ async def collect_name_response(update: Update, context: CallbackContext) -> Non
     display_name = f"{first_name} {last_name}".strip()
 
     updated_events: List[str] = []
-    for event_id in dict.fromkeys(pending_events):
-        update_participant_name(event_id, update.effective_user.id, display_name)
-        ev = get_event(event_id)
-        if ev:
-            updated_events.append(ev.title)
+    updated_event_ids: List[int] = []
+    for event_id, title in pending_pairs:
+        update_participant_name(event_id, user.id, display_name)
+        if title:
+            updated_events.append(title)
+        else:
+            ev = get_event(event_id)
+            if ev:
+                updated_events.append(ev.title)
+        updated_event_ids.append(event_id)
 
-    context.user_data["pending_name_events"] = []
+    remaining = [eid for eid in context.user_data.get("pending_name_events", []) if eid not in updated_event_ids]
+    context.user_data["pending_name_events"] = remaining
+    clear_pending_name_requests(user.id, updated_event_ids)
 
-    confirmation = f"Спасибо! Зафиксировал ваше имя: {display_name}."
-    if updated_events:
-        confirmation += "\nСобытия: " + ", ".join(updated_events)
+    if not updated_events:
+        await message.reply_text(f"Спасибо! Имя сохранено: {display_name}.")
+        return
+
+    confirmation = (
+        f"Спасибо! Зафиксировал ваше имя: {display_name}.\n"
+        f"События: {', '.join(updated_events)}"
+    )
     await message.reply_text(confirmation)
 
 
@@ -943,6 +1110,13 @@ def build_app() -> Application:
 
 
 async def amain() -> None:
+    lock_acquired = False
+    try:
+        lock_acquired = acquire_single_instance_lock()
+    except RuntimeError as exc:
+        logger.error(str(exc))
+        return
+
     app = build_app()
     logger.info("Starting Secret Santa bot with polling…")
     await app.initialize()
@@ -954,6 +1128,8 @@ async def amain() -> None:
         await app.updater.stop()
         await app.stop()
         await app.shutdown()
+        if lock_acquired:
+            release_single_instance_lock()
 
 
 if __name__ == "__main__":

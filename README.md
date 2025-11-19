@@ -6,10 +6,12 @@ A minimal Telegram bot to run Secret Santa.
 
 * Create and manage multiple events in parallel
 * Shareable deep link to join: `https://t.me/<BOT_USERNAME>?start=join_<EVENTID>`
+* Automatic full-name confirmation DM after joining (persists across restarts)
 * Open/close signups; reopen (before drawing)
 * Draw guarantees **one single cycle** over all participants
 * Creator-only illegal edges (giver → receiver not allowed)
 * Stores data in SQLite (`secretsanta.db`)
+* Optional host-level lock to prevent multiple polling instances with the same token
 
 ## Requirements
 
@@ -23,6 +25,9 @@ Set the following variables:
 ```bash
 export BOT_TOKEN="<your_botfather_token>"
 export BOT_USERNAME="<your_bot_username_without_@>"
+# Optional overrides:
+# export SS_DB_PATH="secretsanta.db"
+# export SS_LOCK_FILE="/var/run/ssbot.lock"
 ```
 
 ## Installation
