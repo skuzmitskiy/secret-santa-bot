@@ -569,14 +569,14 @@ async def start_cmd(update: Update, context: CallbackContext) -> None:
         try:
             event_id = int(args[0].split("_", 1)[1])
         except ValueError:
-            await update.message.reply_text("Invalid link.")
+            await update.message.reply_text("Похоже, ссылка недействительна.")
             return
         ev = get_event(event_id)
         if not ev:
-            await update.message.reply_text("Event not found.")
+            await update.message.reply_text("Похоже, событие не найдено.")
             return
         if not ev.join_open:
-            await update.message.reply_text("Signups for this event are closed.")
+            await update.message.reply_text("Регистрация на это событие закрыта.")
             return
         display_name = (user.full_name or user.username or str(user.id)).strip()
         is_new_participant = add_participant(event_id, user.id, display_name)
@@ -588,7 +588,7 @@ async def start_cmd(update: Update, context: CallbackContext) -> None:
             f"\n"
             f"Важный шаг: Чтобы ваш Тайный Санта знал, кому готовить подарок, пожалуйста, подтвердите своё участие, указав свои Имя и Фамилию (полностью).\n"
             f"\n"
-            f"Жеребьевка состоится после окончания регистрации, а вручение подарков запланировано на 30 декабря 2025 года.\n"
+            f"Жеребьевка состоится после окончания регистрации,\nа вручение подарков запланировано на 30 декабря 2025 года.\n"
             f"\n"
             f"Спасибо, что участвуете!",
             parse_mode=ParseMode.HTML,
@@ -682,7 +682,7 @@ async def collect_name_response(update: Update, context: CallbackContext) -> Non
 
     confirmation = (
         f"Спасибо! Зафиксировал ваше имя: {display_name}.\n"
-        f"События: {', '.join(updated_events)}"
+        f"Событие: {', '.join(updated_events)}"
     )
     await message.reply_text(confirmation)
 
