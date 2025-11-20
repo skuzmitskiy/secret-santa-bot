@@ -607,7 +607,7 @@ async def start_cmd(update: Update, context: CallbackContext) -> None:
             context.user_data["pending_name_events"] = pending
             await update.message.reply_text(
                 "Пожалуйста, ответьте на это сообщение и напишите свои Имя и Фамилию через пробел "
-                "для участия в событии «{title}» (ID {eid}). Например: Иван Иванов.".format(
+                "для участия в событии «{title}». Например: Иван Иванов.".format(
                     title=ev.title, eid=ev.id
                 ),
                 parse_mode=ParseMode.HTML,
